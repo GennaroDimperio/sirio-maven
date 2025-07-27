@@ -72,7 +72,7 @@ public class Main {
                 writer.write(r.toString() + "\n");
             }
 
-            // Transiente
+            // Transient
             try {
                 double step = 0.1;
                 double execTime = 10.0;
