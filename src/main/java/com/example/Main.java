@@ -97,7 +97,7 @@ public class Main {
                 }
 
                 double avgPoolZero = Arrays.stream(solMatrix)
-                        .mapToDouble(t -> t[0][11]) // reward If(Pool==0,1,0)
+                        .mapToDouble(t -> t[0][11])
                         .average().orElse(0.0);
                 writer.write("\nAverage transient value of If(Pool==0): " + String.format("%.5f", avgPoolZero) + "\n");
 
