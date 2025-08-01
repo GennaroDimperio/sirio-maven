@@ -19,127 +19,159 @@ import org.oristool.petrinet.PetriNet;
 import org.oristool.util.Pair;
 
 public class Main {
+
+    private static final String NL = System.lineSeparator();
+
     public static void main(String[] args) {
-        System.out.println("Main started");
+        AnalysisResult high = runAnalysis("risultati_high.txt", new int[]{8, 12, 4}, 8);
+        AnalysisResult low  = runAnalysis("risultati_low.txt",  new int[]{2, 3, 1}, 4);
 
-        runAnalysis("risultati.txt", new int[]{2, 3, 1}, 8);
-
-        System.gc();
-
-        runAnalysis("risultati2.txt", new int[]{1, 1, 1}, 4);
+        // Low -> High
+        int deltaPool = high.poolSize - low.poolSize;
+        runTransitionAnalysis("transizione.txt", low.snapshot, low.poolSize, deltaPool);
     }
 
-    public static void runAnalysis(String filename, int[] arrivalRates, int poolSize) {
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(filename, false))) {
 
+    public static AnalysisResult runAnalysis(String fileName, int[] rates, int poolTokens) {
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(fileName, false))) {
+
+            // Parametrs 
             int numPh = 4;
-            int wDiv = 20;
-            int[][] weights = {
-                {1, 1, 1, 1},
-                {1, 2, 3, 4},
-                {4, 3, 2, 1}
-            };
+            int wDiv  = 20;
+            int[][] W = { {1,1,1,1}, {1,2,3,4}, {4,3,2,1} };
+            int rateDiv = 20;   
+            int bphDiv  = 5;
 
-            int rateDiv = 20;
-            int bphDiv = 5;
-            ModelOris2 model = new ModelOris2(arrivalRates, poolSize, numPh, weights, rateDiv, bphDiv, wDiv);
-            PetriNet net = model.build();
-            Marking marking = model.buildInitialMarking(net);
+            ModelOris2 model = new ModelOris2(rates, poolTokens, numPh, W, rateDiv, bphDiv, wDiv);
+            PetriNet net   = model.build();
+            Marking  m0    = model.buildInitialMarking(net);
 
-            System.out.println("Running analysis on: " + filename);
-            writer.write("Initial marking: " + marking + "\n");
+            w.write("Initial marking: " + m0 + NL + NL);
 
             List<RewardRate> rewards = List.of(
-                RewardRate.fromString("Pool"),
-                RewardRate.fromString("P1"),
-                RewardRate.fromString("A1"),
-                RewardRate.fromString("P2"),
-                RewardRate.fromString("A2"),
-                RewardRate.fromString("P3"),
-                RewardRate.fromString("A3"),
-                RewardRate.fromString("Ph1"),
-                RewardRate.fromString("Ph2"),
-                RewardRate.fromString("Ph3"),
-                RewardRate.fromString("Ph4"),
-                RewardRate.fromString("If(Pool==0,1,0)"),
-                RewardRate.fromString("If(A1>0,1,0)"),
-                RewardRate.fromString("If(A2>0,1,0)"),
-                RewardRate.fromString("If(A3>0,1,0)")
+            RewardRate.fromString("Pool"),
+            RewardRate.fromString("Ph1"),
+            RewardRate.fromString("Ph2"),
+            RewardRate.fromString("Ph3"),
+            RewardRate.fromString("Ph4"),
+            RewardRate.fromString("A1"),
+            RewardRate.fromString("A2"),
+            RewardRate.fromString("A3"),
+
+            // QoS metrics
+            RewardRate.fromString("If(Pool==0,1,0)"),                     
+            RewardRate.fromString("If(A1>0 || A2>0 || A3>0,1,0)"),       
+            RewardRate.fromString("Ph1+Ph2+Ph3+Ph4")                     
             );
 
-            writer.write("Rewards:\n");
-            for (RewardRate r : rewards) {
-                writer.write(r.toString() + "\n");
-            }
-
-            // Transient
+            // Transient analysis
+            double[] snapshot = new double[5];
             try {
-                double step = 0.1;
-                double execTime = 10.0;
+                double step = 0.1, time = 40.0;
+                Pair<Map<Marking,Integer>, double[][]> res = GSPNTransient.builder()
+                        .timePoints(0.0, time, step)
+                        .build().compute(net, m0);
 
-                long start = System.currentTimeMillis();
-                Pair<Map<Marking, Integer>, double[][]> result = GSPNTransient.builder()
-                        .timePoints(0.0, execTime, step)
-                        .build().compute(net, marking);
-                long elapsed = System.currentTimeMillis() - start;
-                TransientSolution<Marking, RewardRate> transientRewards = TransientSolution.computeRewards(false,
-                        TransientSolution.fromArray(result.second(), step, result.first(), marking),
+                TransientSolution<Marking,RewardRate> ts = TransientSolution.computeRewards(
+                        false,
+                        TransientSolution.fromArray(res.second(), step, res.first(), m0),
                         rewards.toArray(new RewardRate[0]));
 
-                writer.write("\n--- Transient Reward Values ---\n");
-                double[][][] solMatrix = transientRewards.getSolution();
-                for (int i = 0; i < solMatrix.length; i++) {
-                    writer.write("Time " + String.format("%.2f", (i * step)) + ": ");
-                    for (int j = 0; j < solMatrix[i][0].length; j++) {
-                        writer.write(String.format("%.5f ", solMatrix[i][0][j]));
-                    }
-                    writer.write("\n");
+                w.write("--- Transient rewards ---" + NL);
+                w.write("t ");
+                for (RewardRate r : rewards) w.write(r + " ");
+                w.write(NL);
+
+                double[][][] M = ts.getSolution();
+                for (int i = 0; i < M.length; i++) {
+                    w.write(String.format("%.1f ", i * step));
+                    for (double v : M[i][0]) w.write(String.format("%.5f ", v));
+                    w.write(NL);
                 }
+                w.write(NL);
 
-                double avgPoolZero = Arrays.stream(solMatrix)
-                        .mapToDouble(t -> t[0][11])
-                        .average().orElse(0.0);
-                writer.write("\nAverage transient value of If(Pool==0): " + String.format("%.5f", avgPoolZero) + "\n");
+                snapshot = Arrays.copyOf(M[M.length - 1][0], 5);
 
-            } catch (Exception e) {
-                writer.write("Error in transient:\n" + e.getMessage() + "\n");
-                e.printStackTrace();
+            } catch (Exception ex) {
+                w.write("Transient ERROR: " + ex.getMessage() + NL + NL);
             }
 
-            // Steady-state
+            // Steady-state analysis
             try {
-                int estimatedStates = (int) Math.pow(poolSize + 1, numPh);
-                writer.write("\nEstimated state space size: " + estimatedStates + "\n");
+                Map<Marking, Double> raw = GSPNSteadyState.builder().build().compute(net, m0);
+                Map<Marking, BigDecimal> bd = new HashMap<>();
+                raw.forEach((k,v) -> bd.put(k, BigDecimal.valueOf(v)));
 
-                if (estimatedStates <= 10000) {
-                    Map<Marking, Double> rawSteady = GSPNSteadyState.builder().build().compute(net, marking);
-                    Map<Marking, BigDecimal> converted = new HashMap<>();
-                    for (Map.Entry<Marking, Double> entry : rawSteady.entrySet()) {
-                        converted.put(entry.getKey(), BigDecimal.valueOf(entry.getValue()));
-                    }
-                    SteadyStateSolution<Marking> solution = new SteadyStateSolution<>(converted);
-                    SteadyStateSolution<RewardRate> rewardsState = SteadyStateSolution.computeRewards(solution,
-                            rewards.toArray(new RewardRate[0]));
+                SteadyStateSolution<Marking> ss  = new SteadyStateSolution<>(bd);
+                SteadyStateSolution<RewardRate> ssR = SteadyStateSolution.computeRewards(
+                        ss, rewards.toArray(new RewardRate[0]));
 
-                    writer.write("\n----- Steady-State Rewards -----\n");
-                    for (Map.Entry<RewardRate, BigDecimal> entry : rewardsState.getSteadyState().entrySet()) {
-                        writer.write(entry.getKey() + " : " + entry.getValue() + "\n");
-                    }
-                } else {
-                    writer.write("Steady-state skipped: estimated state space too large (" + estimatedStates + " states)\n");
-
+                w.write("--- Steady-state rewards ---" + NL);
+                for (RewardRate r : rewards) {
+                    w.write(r + " : " + ssR.getSteadyState().get(r) + NL);
                 }
-
-            } catch (Exception e) {
-                writer.write("Error in steady-state:\n" + e.getMessage() + "\n");
-                e.printStackTrace();
+                w.write(NL);
+            } catch (Exception ex) {
+                w.write("Steady-state ERROR: " + ex.getMessage() + NL);
             }
 
-            writer.flush();
-
-        } catch (IOException e) {
-            System.err.println("Error while writing the file:");
-            e.printStackTrace();
+            w.flush();
+            return new AnalysisResult(snapshot, poolTokens);
+        } catch (IOException ioe) {
+            ioe.printStackTrace();
+            return null;
         }
+    }
+
+
+    public static void runTransitionAnalysis(String fileName, double[] probsLow,
+                                             int lowPoolTokens, int deltaPool) {
+        try (BufferedWriter w = new BufferedWriter(new FileWriter(fileName, false))) {
+
+            PetriNet net = ModelOris2.getThirdModel(probsLow);
+            Marking  m0  = ModelOris2.getThirdModelInitialMarking(net, probsLow, lowPoolTokens, deltaPool);
+
+            double step = 0.1, time = 40.0;
+            Pair<Map<Marking,Integer>, double[][]> res = GSPNTransient.builder()
+                    .timePoints(0.0, time, step)
+                    .build().compute(net, m0);
+
+            List<RewardRate> rewards = List.of(
+            RewardRate.fromString("Pool"),
+            RewardRate.fromString("Ph1"),
+            RewardRate.fromString("Ph2"),
+            RewardRate.fromString("Ph3"),
+            RewardRate.fromString("Ph4"),
+            RewardRate.fromString("If(Pool==0,1,0)"),
+            RewardRate.fromString("Ph1+Ph2+Ph3+Ph4") 
+            );
+
+            TransientSolution<Marking,RewardRate> ts = TransientSolution.computeRewards(
+                false,
+                TransientSolution.fromArray(res.second(), step, res.first(), m0),
+                rewards.toArray(new RewardRate[0]));
+
+        w.write("--- Transient rewards (transition) ---" + NL);
+        w.write("t ");
+        for (RewardRate r : rewards) w.write(r + " ");
+        w.write(NL);
+
+        double[][][] M = ts.getSolution();
+        for (int i = 0; i < M.length; i++) {
+            w.write(String.format("%.1f ", i * step));
+            for (double v : M[i][0]) w.write(String.format("%.5f ", v));
+            w.write(NL);
+        }
+                    w.flush();
+                } catch (IOException ioe) {
+                    ioe.printStackTrace();
+                }
+    }
+
+    // AnalysisResult class to hold the results of the analysis
+    public static class AnalysisResult {
+        public final double[] snapshot;
+        public final int      poolSize;
+        public AnalysisResult(double[] snap, int pool) { this.snapshot = snap; this.poolSize = pool; }
     }
 }
