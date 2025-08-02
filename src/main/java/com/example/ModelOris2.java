@@ -1,8 +1,8 @@
 package com.example;
 
 import java.math.BigDecimal;
-import java.util.Arrays;
 
+import org.oristool.models.pn.Priority;
 import org.oristool.models.stpn.MarkingExpr;
 import org.oristool.models.stpn.trees.StochasticTransitionFeature;
 import org.oristool.petrinet.Marking;
@@ -12,161 +12,204 @@ import org.oristool.petrinet.Transition;
 
 public class ModelOris2 {
 
-    private final int[] arrivalRates;            
-    private final int   poolSize;                
-    private final int   numPh;                   
-    private final int[][] weights;               
-    private final int   rateDiv;                 
-    private final int   bphDiv;                  
-    private final int   wDiv;                    
+    private final int[]   arrival;        
+    private final int     poolSize;
+    private final int     numPh;
+    private final int[][] W;
+    private final int     rateDiv, bphDiv, wDiv;
 
-    public ModelOris2(int[] arrivalRates,
-                      int   poolSize,
-                      int   numPh,
-                      int[][] weights,
-                      int   rateDiv,
-                      int   bphDiv,
-                      int   wDiv) {
-        this.arrivalRates = arrivalRates;
-        this.poolSize     = poolSize;
-        this.numPh        = numPh;
-        this.weights      = weights;
-        this.rateDiv      = rateDiv;
-        this.bphDiv       = bphDiv;
-        this.wDiv         = wDiv;
+    public ModelOris2(int[] arrivalRates, int poolSize,
+                      int numPh, int[][] W,
+                      int rateDiv, int bphDiv, int wDiv) {
+
+        this.arrival  = arrivalRates;
+        this.poolSize = poolSize;
+        this.numPh    = numPh;
+        this.W        = W;
+        this.rateDiv  = rateDiv;
+        this.bphDiv   = bphDiv;
+        this.wDiv     = wDiv;
     }
 
     public PetriNet build() {
 
         PetriNet net = new PetriNet();
-
         Place pool = net.addPlace("Pool");
 
-        Place[] px  = new Place[3];  // P1-P3
-        Place[] ax  = new Place[3];  // A1-A3
+        
+        Place[] P = new Place[3];
+        Place[] A = new Place[3];
         for (int i = 0; i < 3; i++) {
-            px[i] = net.addPlace("P" + (i + 1));
-            ax[i] = net.addPlace("A" + (i + 1));
-
+            P[i] = net.addPlace("P"+(i+1));
+            A[i] = net.addPlace("A"+(i+1));
         }
 
-        Place[] phx = new Place[numPh];          // Ph1-Ph4
+        // Ph
+        Place[] Ph = new Place[numPh];
         for (int j = 0; j < numPh; j++)
-            phx[j] = net.addPlace("Ph" + (j + 1));
+            Ph[j] = net.addPlace("Ph"+(j+1));
+
+        net.addPlace("RateDiv");
+        net.addPlace("BphDiv");
+        net.addPlace("WDiv");
+
+        for (int i = 0; i < 3; i++)                    
+            net.addPlace("Rate"+(i+1));
+
+        for (int i = 0; i < 3; i++)                  
+            for (int j = 0; j < numPh; j++)
+                net.addPlace("W"+(i+1)+(j+1));
 
         for (int i = 0; i < 3; i++) {
-            Transition rel = net.addTransition("release" + (i + 1));
-            BigDecimal λ   = BigDecimal.valueOf(arrivalRates[i])
-                                        .divide(BigDecimal.valueOf(rateDiv));
-            rel.addFeature(StochasticTransitionFeature
-                        .newExponentialInstance(λ, MarkingExpr.from("1", net)));
-
-            net.addPrecondition(px[i], rel);   
-            net.addPrecondition(pool , rel);   
-            net.addPostcondition(rel, ax[i]);
-            net.addPostcondition(rel, px[i]);
-
+            Transition r = net.addTransition("release"+(i+1));
+            r.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                    BigDecimal.ONE,
+                    MarkingExpr.from("Rate"+(i+1)+"/RateDiv", net)));
+            net.addPrecondition(pool, r);
+            net.addPrecondition(P[i], r);
+            net.addPostcondition(r, A[i]);
+            net.addPostcondition(r, P[i]);
         }
 
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < numPh; j++) {
-                double w    = weights[i][j] / (double) wDiv;
-                double rate = (w == 0) ? 1e-12 : w;
-
-                Transition tij = net.addTransition("t" + (i + 1) + (j + 1));
-                tij.addFeature(StochasticTransitionFeature
-                            .newExponentialInstance(
-                                BigDecimal.valueOf(rate),
-                                MarkingExpr.from("1", net)));
-
-                net.addPrecondition(ax[i], tij);      
-                net.addPostcondition(tij , phx[j]);  
+                double rate = W[i][j] / (double) wDiv;
+                Transition d = net.addTransition("d"+(i+1)+(j+1));
+                d.addFeature(StochasticTransitionFeature.newDeterministicInstance(
+                        BigDecimal.ZERO,
+                        MarkingExpr.from(Double.toString(rate), net)));
+                d.addFeature(new Priority(0));
+                net.addPrecondition(A[i], d);
+                net.addPostcondition(d, Ph[j]);
             }
 
+        
         for (int j = 0; j < numPh; j++) {
-            Transition svc = net.addTransition("t" + (j + 1));
-            BigDecimal μ   = BigDecimal.valueOf(j + 1)
-                                    .divide(BigDecimal.valueOf(bphDiv));
-            svc.addFeature(StochasticTransitionFeature
-                        .newExponentialInstance(
-                            μ,
-                            MarkingExpr.from("Ph" + (j + 1), net)));
-
-            net.addPrecondition(phx[j], svc);                
-            Place dst = (j < numPh - 1) ? phx[j + 1] : pool;
-            net.addPostcondition(svc, dst);
+            Transition s = net.addTransition("svc"+(j+1));
+            s.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                    BigDecimal.ONE,
+                    MarkingExpr.from((j+1)+"*Ph"+(j+1)+"/BphDiv", net)));
+            net.addPrecondition(Ph[j], s);
+            net.addPostcondition(s, (j < numPh-1) ? Ph[j+1] : pool);
         }
-
         return net;
     }
 
     public Marking buildInitialMarking(PetriNet net) {
         Marking m = new Marking();
+        m.setTokens(net.getPlace("RateDiv"), rateDiv);
+        m.setTokens(net.getPlace("BphDiv"),  bphDiv);
+        m.setTokens(net.getPlace("WDiv"),    wDiv);
+
+        for (int i = 0; i < 3; i++)
+            m.setTokens(net.getPlace("Rate"+(i+1)), arrival[i]);
+
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < numPh; j++)
+                m.setTokens(net.getPlace("W"+(i+1)+(j+1)), W[i][j]);
+
+        /* operativi */
         m.setTokens(net.getPlace("Pool"), poolSize);
-        m.setTokens(net.getPlace("P1"),   1);
-        m.setTokens(net.getPlace("P2"),   1);
-        m.setTokens(net.getPlace("P3"),   1);
+        m.setTokens(net.getPlace("P1"), 1);
+        m.setTokens(net.getPlace("P2"), 1);
+        m.setTokens(net.getPlace("P3"), 1);
         return m;
     }
 
-    // third model
-    public static PetriNet getThirdModel(double[] probs){
-        PetriNet net=new PetriNet(); Place init=net.addPlace("Init");
-        Place[] tgt={net.addPlace("Pool"),net.addPlace("Ph1"),net.addPlace("Ph2"),net.addPlace("Ph3"),net.addPlace("Ph4")};
-        String[] names={"Pool","Ph1","Ph2","Ph3","Ph4"};
-        double tot=Arrays.stream(probs).sum();
-        for(int i=0;i<5;i++){
-            double p=(tot==0)?0:probs[i]/tot; double rate=(p==0)?1e-12:p;
-            Transition t=net.addTransition("tInit_"+names[i]);
-            t.addFeature(StochasticTransitionFeature.newExponentialInstance(BigDecimal.valueOf(rate),MarkingExpr.from("1",net)));
-            net.addPrecondition(init,t); net.addPostcondition(t,tgt[i]); }
-        return net; }
+    public static PetriNet getThirdModel(double[] wLow,      // pesi Init
+                                         int[]    rateLow,   // {2,3,1}
+                                         int[]    rateHigh,  // {8,12,4}
+                                         double   tSwitch) {
 
-    public static Marking getThirdModelInitialMarking(PetriNet net,
-                                                  double[] probs,
-                                                  int lowPool,
-                                                  int deltaPool) {
-                Marking m = new Marking();
-                String[] n = {"Pool","Ph1","Ph2","Ph3","Ph4"};
+        PetriNet net = new PetriNet();
 
-            double tot = Arrays.stream(probs).sum();
-            int[] tok = new int[5];
-            int assigned = 0;
-            for (int i = 0; i < 5; i++) {
-                double p = (tot == 0) ? 0 : probs[i] / tot;
-                tok[i]   = (p > 0) ? Math.max(1, (int) Math.round(p * lowPool)) : 0;
-                assigned += tok[i];
+        Place pool = net.addPlace("Pool");
+        Place[] P  = { net.addPlace("P1"), net.addPlace("P2"), net.addPlace("P3") };
+        Place[] A  = { net.addPlace("A1"), net.addPlace("A2"), net.addPlace("A3") };
+        Place[] Ph = { net.addPlace("Ph1"), net.addPlace("Ph2"),
+                       net.addPlace("Ph3"), net.addPlace("Ph4") };
+
+        Place init = net.addPlace("Init");
+        Place[] targets = { pool, Ph[0], Ph[1], Ph[2], Ph[3] };
+        String[] names  = { "Pool","Ph1","Ph2","Ph3","Ph4" };
+        for (int i = 0; i < targets.length; i++) {
+            Transition t = net.addTransition("tInit_"+names[i]);
+            double w = wLow[i] <= 0 ? 1e-12 : wLow[i];
+            t.addFeature(StochasticTransitionFeature.newDeterministicInstance(
+                    BigDecimal.ZERO,
+                    MarkingExpr.from(Double.toString(w), net)));
+            net.addPrecondition(init, t);          // Init si scarica
+            net.addPostcondition(t, targets[i]);
+        }
+
+        Place lowGate  = net.addPlace("PhaseLow");
+        Place highGate = net.addPlace("PhaseHigh");
+        Transition sw  = net.addTransition("tSwitchPhase");
+        sw.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                BigDecimal.valueOf(1.0 / tSwitch), MarkingExpr.from("1", net)));
+        net.addPrecondition(lowGate, sw);
+        net.addPostcondition(sw, highGate);
+
+        for (int i = 0; i < 3; i++) {
+            addRelease(net, "Low",  i, rateLow[i],  pool, P[i], A[i], lowGate);
+            addRelease(net, "High", i, rateHigh[i], pool, P[i], A[i], highGate);
+        }
+
+        int[][] Wbase = { {1,1,1,1}, {1,2,3,4}, {4,3,2,1} };
+        int wDiv = 20;
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++) {
+                double rate = Wbase[i][j] / (double) wDiv;
+                Transition d = net.addTransition("d"+(i+1)+(j+1));
+                d.addFeature(StochasticTransitionFeature.newDeterministicInstance(
+                        BigDecimal.ZERO,
+                        MarkingExpr.from(Double.toString(rate), net)));
+                d.addFeature(new Priority(0));
+                net.addPrecondition(A[i], d);
+                net.addPostcondition(d, Ph[j]);
             }
 
-            int missing = lowPool - assigned;  
-                while (missing != 0) {
-                    int idx = missing > 0
-                         ? argMax(tok)        
-                         : argMinPositive(tok); 
-                        tok[idx] += (missing > 0) ? 1 : -1;
-                        missing  += (missing > 0) ? -1 : 1;
-            }
+        int bphDiv = 5;
+        for (int j = 0; j < 4; j++) {
+            Transition s = net.addTransition("svc"+(j+1));
+            s.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                    BigDecimal.ONE,
+                    MarkingExpr.from((j+1)+"*Ph"+(j+1)+"/"+bphDiv, net)));
+            net.addPrecondition(Ph[j], s);
+            net.addPostcondition(s, (j < 3) ? Ph[j+1] : pool);
+        }
 
-    for (int i = 0; i < 5; i++) {
-        m.setTokens(net.getPlace(n[i]), tok[i]);
+        return net;
     }
 
-    int poolTok = m.getTokens(net.getPlace("Pool"));
-    m.setTokens(net.getPlace("Pool"), poolTok + deltaPool);
-    m.setTokens(net.getPlace("Init"), deltaPool);
+    private static void addRelease(PetriNet net, String tag, int idx, int λ,
+                                   Place pool, Place Pi, Place Ai, Place gate) {
 
-    return m;
-}
+        Transition r = net.addTransition("release"+(idx+1)+"_"+tag);
+        r.addFeature(StochasticTransitionFeature.newExponentialInstance(
+                BigDecimal.valueOf(λ), MarkingExpr.from("1", net)));
 
-private static int argMax(int[] v) {
-    int idx = 0;
-    for (int i = 1; i < v.length; i++) if (v[i] > v[idx]) idx = i;
-    return idx;
-}
-private static int argMinPositive(int[] v) {
-    int idx = -1;
-    for (int i = 0; i < v.length; i++)
-        if (v[i] > 0 && (idx == -1 || v[i] < v[idx])) idx = i;
-    return idx;
-}
+        net.addPrecondition(pool, r);
+        net.addPrecondition(Pi,  r);
+        net.addPrecondition(gate, r);
+
+        net.addPostcondition(r, Ai);   
+        net.addPostcondition(r, Pi);   
+        net.addPostcondition(r, gate);
+    }
+
+    public static Marking getThirdModelInitialMarking(PetriNet net,
+                                                      int lowPool,
+                                                      int deltaPool) {
+
+        Marking m = new Marking();
+        m.setTokens(net.getPlace("PhaseLow"), 1);  
+        m.setTokens(net.getPlace("Init"),     lowPool);
+        m.setTokens(net.getPlace("Pool"),     deltaPool);
+        m.setTokens(net.getPlace("P1"), 1);
+        m.setTokens(net.getPlace("P2"), 1);
+        m.setTokens(net.getPlace("P3"), 1);
+
+        return m;
+    }
 }
