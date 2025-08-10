@@ -21,20 +21,22 @@ import org.oristool.util.Pair;
 public class Main {
 
     private static final String NL = System.lineSeparator();
-    private static final double  T_SWITCH = 20.0;
+    private static final double  T_SWITCH = 10.0;
 
     public static void main(String[] args) {
 
+        int[] rateLow   = { 2,  3, 1 };    // before switch
+        int[] rateHigh  = { 8, 12, 4 };    // after switch
+
         AnalysisResult high = runAnalysis("risultati_high.txt",
-                                          new int[]{8, 12, 4},   
+                                          rateHigh,   
                                           8);                    
         AnalysisResult low  = runAnalysis("risultati_low.txt",
-                                          new int[]{2,  3,  1},
+                                          rateLow,
                                           4);
 
         int   deltaPool = high.poolSize - low.poolSize;   // 8 – 4 = 4
-        int[] rateLow   = { 2,  3, 1 };    // before switch
-        int[] rateHigh  = { 8, 12, 4 };    // after switch
+       
 
         runTransitionAnalysis("transizione.txt",
                               low.snapshot,     
@@ -149,7 +151,7 @@ public class Main {
             Marking  m0  = ModelOris2.getThirdModelInitialMarking(
                                net, lowPoolTokens, deltaPool);
 
-            double step = 0.1, time = 40.0;
+            double step = 0.1, time = 20.0;
             Pair<Map<Marking,Integer>, double[][]> res =
                     GSPNTransient.builder()
                                  .timePoints(0.0, time, step)
@@ -161,7 +163,9 @@ public class Main {
                 RewardRate.fromString("Ph1"),
                 RewardRate.fromString("Ph2"),
                 RewardRate.fromString("Ph3"),
-                RewardRate.fromString("Ph4")
+                RewardRate.fromString("Ph4"),
+                RewardRate.fromString("PhaseLow"),   // 0 o 1
+                RewardRate.fromString("PhaseHigh")   // 0 o 1
             );
 
             TransientSolution<Marking,RewardRate> ts =
