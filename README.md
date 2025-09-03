@@ -8,7 +8,7 @@ Obiettivo: scegliere il **minimo** `Pool+busy` che rispetta **SLO** (tasso di re
 - Maven
 - Libreria **Sirio 2.0.5** dichiarata nel `pom.xml`
 
-## Struttura (minimo)
+## Struttura
 `src/main/java/com/example/`
 - **ModelOris2_fase4.java** – modello GSPN (fase 4). 
   - Include helper per settare e leggere i parametri (`Pool`, `Rate*`, pesi `W**`, ecc.).
