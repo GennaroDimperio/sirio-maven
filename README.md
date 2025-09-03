@@ -63,10 +63,7 @@ CSV per intervalli: timeseries_intervals.csv
 
 ### File prodotti
 - `timeseries_sli.csv`
-  ```
-  total_time_s,rejections,rejection_rate,idle_mean
-  299.144,2,0.006329,4.435
-  ```
+  
 - `timeseries_intervals.csv`
   (metriche per intervallo: `t_start,t_end,pool_now,target_tot,...`)
 
