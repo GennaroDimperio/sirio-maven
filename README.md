@@ -84,7 +84,7 @@ Produce `arrivals.csv` con carico “a risacca”.
 
 ## Come valutare
 - **Qualità**: `rejection_rate` complessivo ≤ **0.01**
-- **Efficienza**: `idle_mean` (più basso = meglio), più breakdown per intervallo in `timeseries_intervals.csv`.
+- **Efficienza**: `idle_mean` (più basso = meglio)`.
 
 ## Riproducibilità
 - Seed fisso nei generatori/simulatori.
