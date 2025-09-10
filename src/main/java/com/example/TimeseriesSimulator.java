@@ -14,14 +14,15 @@ import java.util.Random;
  * TimeseriesSimulator
  *
  * Pipeline:
- *  1) legge la timeseries dal file arrivals.csv (t,cls)
- *  2) disabilita gli arrivi automatici dal modello GSPN
- *  3) ogni T=10s:
- *      - stima i rate sugli ultimi W=20s
- *      - calcola il totale target di repliche (pool+busy) per i prossimi 10s
- *        scegliendo il MINIMO valore tale che la rejection prevista ≤ SLO
- *      - applica subito i token in Pool per ottenere quel totale
- *  4) integra l’idle e conta le rejection reali
+ *  1) legge la time series dal file arrivals.csv
+ *  2) disattiva gli arrivi automatici del modello GSPN 
+ *  3) ogni CONTROL_PERIOD_SEC:
+ *      - stima i rate sugli ultimi ESTIMATE_WINDOW_SEC
+ *      - sceglie il totale minimo di repliche (pool+busy) per i prossimi PREDICTION_HORIZON_SEC
+ *        tale che la rejection prevista ≤ TARGET_REJECTION
+ *      - imposta subito i token in Pool per raggiungere quel totale
+ *  4) tra un evento e l’altro fa avanzare il modello con la “gara di esponenziali”
+ *     e integra l’idle (area sotto Pool)
  *
  * Output:
  *  - stdout con metriche globali
@@ -29,261 +30,254 @@ import java.util.Random;
  */
 public class TimeseriesSimulator {
 
-  // ===== Parametri controller / stima =====
-  static final double W_WINDOW_SEC   = 20.0;  // ampiezza finestra per stima dei rate
-  static final double ADAPT_STEP_SEC = 10.0;  // periodo dell’adattatore T
-  static final double PRED_HORIZ_SEC = 10.0;  // orizzonte di predizione
-  static final double SLO            = 0.01;  // target di rejection (max)
+  // ===== Parametri controller e stima =====
+  static final double ESTIMATE_WINDOW_SEC    = 20.0;  // ampiezza finestra stima rate
+  static final double CONTROL_PERIOD_SEC     = 10.0;  // periodo del controllore
+  static final double PREDICTION_HORIZON_SEC = 10.0;  // orizzonte predizione
+  static final double TARGET_REJECTION       = 0.01;  // SLO: max rejection rate
 
   // ===== Limiti risorse =====
-  static final int POOL_MIN = 1;
-  static final int POOL_MAX = 24;
+  static final int MIN_POOL = 1;
+  static final int MAX_POOL = 24;
 
   // ===== Logging =====
-  static final int LOG_EVERY = 50;
+  static final int PROGRESS_EVERY = 50;
 
   // ===== Diagnostica predizione =====
-  static double LAST_PRED_REJ_RATE = Double.NaN;
-  static int    LAST_PRED_N        = 0;
+  static double lastPredictedRejectionRate = Double.NaN;
+  static int    lastPredictedSampleCount   = 0;
 
-  // ===== Modello GSPN =====
-  static class Arrival {
-    final double t; final int cls;
-    Arrival(double t, int cls){ this.t = t; this.cls = cls; }
+  // ===== Strutture dati =====
+  static final class ArrivalEvent {
+    final double timeSec;
+    final int    classId;
+    ArrivalEvent(double t, int c){ this.timeSec = t; this.classId = c; }
   }
 
-  // Cache di BphDiv per i tempi medi “statici” nello snapshot
-  static Integer CACHED_BPH = null;
+  // Cache di BphDiv per lo snapshot
+  static Integer cachedBphDiv = null;
 
   public static void main(String[] args) throws Exception {
     final String arrivalsPath = (args != null && args.length > 0) ? args[0] : "arrivals.csv";
 
-    ModelOris2_fase4.GspnModel m = ModelOris2_fase4.build();
-    disableAutomaticArrivals(m);
+    ModelOris2_fase4.GspnModel model = ModelOris2_fase4.build();
+    disableModelAutomaticArrivals(model);
 
-    List<Arrival> arr = readArrivals(arrivalsPath);
-    System.out.println("[info] arrivals file: " + arrivalsPath + "  |  letti " + arr.size() + " arrivi");
-    if (arr.isEmpty()) return;
+    List<ArrivalEvent> arrivals = loadArrivalsCsv(arrivalsPath);
+    System.out.println("[info] arrivals file: " + arrivalsPath + "  |  letti " + arrivals.size() + " arrivi");
+    if (arrivals.isEmpty()) return;
 
-    SlidingRateEstimator est = new SlidingRateEstimator(W_WINDOW_SEC, ADAPT_STEP_SEC);
+    SlidingRateEstimator estimator = new SlidingRateEstimator(ESTIMATE_WINDOW_SEC, CONTROL_PERIOD_SEC);
     Random rng = new Random(777);
 
     // Metriche globali
-    double totalTime = 0.0;
-    double idleIntegral = 0.0;
-    int rejections = 0;
+    double simTimeAccum = 0.0;
+    double idleAreaAccum = 0.0;
+    int totalRejections = 0;
 
-    // Metriche per intervallo di adattamento
-    double intervalStart = arr.get(0).t;
+    // Metriche per intervallo
+    double intervalStart = arrivals.get(0).timeSec;
     int arrivalsInInterval = 0;
     int rejectsInInterval  = 0;
-    double idleIntInterval = 0.0;
-    int    lastChosenTot      = -1;
-    double lastEffectiveChange= -1.0;
+    double idleAreaInterval = 0.0;
+    int    lastChosenTotal   = -1;
+    double lastEffectiveChangeTime = -1.0;
 
-    try (PrintWriter csvInt = new PrintWriter(new FileWriter("timeseries_intervals.csv"));
-         PrintWriter csvSum = new PrintWriter(new FileWriter("timeseries_sli.csv"))) {
+    try (PrintWriter csvIntervals = new PrintWriter(new FileWriter("timeseries_intervals.csv"));
+         PrintWriter csvSummary   = new PrintWriter(new FileWriter("timeseries_sli.csv"))) {
 
-      csvInt.println("t_start,t_end,pool_now,target_tot,eff_change_time,arrivals,rejections,rejection_rate,idle_mean_interval,pred_rej_at_target,pred_n");
-      csvSum.println("total_time_s,rejections,rejection_rate,idle_mean");
+      csvIntervals.println("t_start,t_end,pool_now,target_tot,eff_change_time,arrivals,rejections,rejection_rate,idle_mean_interval,pred_rej_at_target,pred_n");
+      csvSummary.println("total_time_s,rejections,rejection_rate,idle_mean");
 
-      double simClock = arr.get(0).t;
-      double nextCtrl = roundUpToGrid(simClock, ADAPT_STEP_SEC);
+      double simClock = arrivals.get(0).timeSec;
+      double nextControl = ceilToGrid(simClock, CONTROL_PERIOD_SEC);
 
-      for (int i = 0; i < arr.size(); i++) {
-        Arrival a = arr.get(i);
+      for (int i = 0; i < arrivals.size(); i++) {
+        ArrivalEvent ev = arrivals.get(i);
 
         // Il controller può scattare più volte prima del prossimo arrivo
-        while (nextCtrl <= a.t) {
-          // Avanza dinamica fino a nextCtrl e integra l'idle
-          Delta d = advanceAndIntegrate(m, rng, simClock, nextCtrl);
-          idleIntegral    += d.idle;
-          idleIntInterval += d.idle;
-          totalTime       += d.dt;
-          simClock         = nextCtrl;
+        while (nextControl <= ev.timeSec) {
+          // Avanza dinamica fino a nextControl e integra idle
+          StepDelta d = advanceModelAndIntegrateIdle(model, rng, simClock, nextControl);
+          idleAreaAccum    += d.idleArea;
+          idleAreaInterval += d.idleArea;
+          simTimeAccum     += d.dt;
+          simClock          = nextControl;
 
-          // Stimo i rate sugli ultimi W (qui NON usati dal baseline,
-          // ma utili per diagnostica/estensioni del controller)
-          SlidingRateEstimator.Rates r = est.estimateRatesAt(nextCtrl);
-          // System.out.println("[diag] rates @"+nextCtrl+"s = "+r);
+          SlidingRateEstimator.Rates rates = estimator.estimateRatesAt(nextControl);
 
           // Calcolo il totale minimo di repliche che rispetta lo SLO nel prossimo orizzonte
-          int chosenTotReplicas = chooseTotalReplicasMinSLO(
-              m, nextCtrl, PRED_HORIZ_SEC, arr, i, rng
+          int chosenTotalReplicas = chooseMinReplicasMeetingSLO(
+              model, nextControl, PREDICTION_HORIZON_SEC, arrivals, i, rng
           );
 
-          // Applico: pool = clamp( chosenTot - busy, [POOL_MIN, POOL_MAX] )
-          int busyNow  = busyCount(m);
-          int needPool = Math.max(0, chosenTotReplicas - busyNow);
-          set(m, "Pool", Math.max(POOL_MIN, Math.min(POOL_MAX, needPool)));
+          int busyNow  = countBusy(model);
+          int needPool = Math.max(0, chosenTotalReplicas - busyNow);
+          setTokens(model, "Pool", Math.max(MIN_POOL, Math.min(MAX_POOL, needPool)));
 
-          lastChosenTot       = chosenTotReplicas;
-          lastEffectiveChange = nextCtrl;
+          lastChosenTotal         = chosenTotalReplicas;
+          lastEffectiveChangeTime = nextControl;
 
-          // Log intervallo chiuso all’istante nextCtrl
-          int poolNow = get(m,"Pool");
-          writeIntervalIfClosed(csvInt, intervalStart, nextCtrl,
-              poolNow, lastChosenTot, lastEffectiveChange,
-              arrivalsInInterval, rejectsInInterval, idleIntInterval,
-              LAST_PRED_REJ_RATE, LAST_PRED_N);
+          int poolNow = getTokens(model,"Pool");
+          writeIntervalRowIfClosed(csvIntervals, intervalStart, nextControl,
+              poolNow, lastChosenTotal, lastEffectiveChangeTime,
+              arrivalsInInterval, rejectsInInterval, idleAreaInterval,
+              lastPredictedRejectionRate, lastPredictedSampleCount);
 
-          // Reset intervallo
-          intervalStart       = nextCtrl;
-          arrivalsInInterval  = 0;
-          rejectsInInterval   = 0;
-          idleIntInterval     = 0.0;
+          intervalStart        = nextControl;
+          arrivalsInInterval   = 0;
+          rejectsInInterval    = 0;
+          idleAreaInterval     = 0.0;
 
-          nextCtrl += ADAPT_STEP_SEC;
+          nextControl += CONTROL_PERIOD_SEC;
         }
 
         // Registra arrivo per la stima (finestra mobile)
-        est.add(a.t, a.cls);
+        estimator.add(ev.timeSec, ev.classId);
 
         // Avanza fino all'arrivo e integra l'idle
-        Delta d = advanceAndIntegrate(m, rng, simClock, a.t);
-        idleIntegral    += d.idle;
-        idleIntInterval += d.idle;
-        totalTime       += d.dt;
-        simClock         = a.t;
+        StepDelta d = advanceModelAndIntegrateIdle(model, rng, simClock, ev.timeSec);
+        idleAreaAccum    += d.idleArea;
+        idleAreaInterval += d.idleArea;
+        simTimeAccum     += d.dt;
+        simClock          = ev.timeSec;
 
-        // Inject dell'arrivo (probability switch manuale). Rejection se Pool==0
-        boolean ok = injectArrival(m, a.cls, rng);
-        if (!ok) { rejections++; rejectsInInterval++; }
+        // Inject dell'arrivo: instrada verso Ph1..Ph4 secondo i pesi Wxy
+        boolean accepted = injectArrival(model, ev.classId, rng);
+        if (!accepted) { totalRejections++; rejectsInInterval++; }
         arrivalsInInterval++;
 
-        if ((i+1) % LOG_EVERY == 0) {
+        if ((i+1) % PROGRESS_EVERY == 0) {
           System.out.printf(Locale.US,
               "[progress] %d/%d  t=%.3f  rej=%d  Pool=%d  busy=%d%n",
-              (i+1), arr.size(), a.t, rejections, get(m,"Pool"), busyCount(m));
+              (i+1), arrivals.size(), ev.timeSec, totalRejections, getTokens(model,"Pool"), countBusy(model));
         }
       }
 
       // Chiusura ultimo intervallo a fine serie
-      double lastT = arr.get(arr.size()-1).t;
-      int poolNowEnd = get(m, "Pool");
-      writeIntervalIfClosed(csvInt, intervalStart, lastT,
-          poolNowEnd, lastChosenTot, lastEffectiveChange,
-          arrivalsInInterval, rejectsInInterval, idleIntInterval,
-          LAST_PRED_REJ_RATE, LAST_PRED_N);
+      double lastT = arrivals.get(arrivals.size()-1).timeSec;
+      int poolNowEnd = getTokens(model, "Pool");
+      writeIntervalRowIfClosed(csvIntervals, intervalStart, lastT,
+          poolNowEnd, lastChosenTotal, lastEffectiveChangeTime,
+          arrivalsInInterval, rejectsInInterval, idleAreaInterval,
+          lastPredictedRejectionRate, lastPredictedSampleCount);
 
       // Metriche complessive
-      double idleMean = (totalTime > 0) ? idleIntegral / totalTime : 0.0;
-      double rejRate  = !arr.isEmpty()  ? (double) rejections / arr.size() : 0.0;
+      double idleMean = (simTimeAccum > 0) ? idleAreaAccum / simTimeAccum : 0.0;
+      double rejRate  = !arrivals.isEmpty() ? (double) totalRejections / arrivals.size() : 0.0;
 
       System.out.println();
-      System.out.println("== RISULTATI TIMESERIES (baseline) ==");
-      System.out.println("Tempo totale simulato: " + String.format(Locale.US,"%.3f", totalTime) + " s");
-      System.out.println("Rejection totali:      " + rejections);
+      System.out.println("== RISULTATI TIMESERIES ==");
+      System.out.println("Tempo totale simulato: " + String.format(Locale.US,"%.3f", simTimeAccum) + " s");
+      System.out.println("Rejection totali:      " + totalRejections);
       System.out.println("Rejection rate:        " + String.format(Locale.US,"%.6f", rejRate));
       System.out.println("Idle medio (Pool):     " + String.format(Locale.US,"%.3f", idleMean));
 
-      csvSum.printf(Locale.US, "%.3f,%d,%.6f,%.3f%n", totalTime, rejections, rejRate, idleMean);
+      csvSummary.printf(Locale.US, "%.3f,%d,%.6f,%.3f%n", simTimeAccum, totalRejections, rejRate, idleMean);
       System.out.println("CSV scritto: timeseries_sli.csv");
       System.out.println("CSV per intervalli: timeseries_intervals.csv");
     }
   }
 
-  // ----------------- Controller (baseline) -----------------
+  // ----------------- Controller -----------------
 
   /**
-   * Ritorna il MINIMO totale di repliche (pool+busy) tale che,
-   * simulando i prossimi 'horizon' secondi con totale costante (nessun ritardo),
-   * la rejection prevista ≤ SLO.
+   * Sceglie il minimo totale di repliche (pool+busy) tale che,
+   * simulando i prossimi 'horizon' secondi con totale costante,
+   * la rejection prevista ≤ TARGET_REJECTION.
    */
-  static int chooseTotalReplicasMinSLO(
-      ModelOris2_fase4.GspnModel m,
+  static int chooseMinReplicasMeetingSLO(
+      ModelOris2_fase4.GspnModel model,
       double now,
       double horizon,
-      List<Arrival> arr,
+      List<ArrivalEvent> allArrivals,
       int currentIdx,
       Random rng
   ){
     // Stato attuale
-    int poolNow = get(m,"Pool");
-    int ph1 = get(m,"Ph1"), ph2 = get(m,"Ph2"), ph3 = get(m,"Ph3"), ph4 = get(m,"Ph4");
+    int poolNow = getTokens(model,"Pool");
+    int ph1 = getTokens(model,"Ph1"), ph2 = getTokens(model,"Ph2"), ph3 = getTokens(model,"Ph3"), ph4 = getTokens(model,"Ph4");
     int busyNow = ph1 + ph2 + ph3 + ph4;
 
     // Finestra futura da simulare
     double end = now + horizon;
-    List<Arrival> future = sliceArrivals(arr, now, end, currentIdx);
+    List<ArrivalEvent> future = sliceArrivalsInWindow(allArrivals, now, end, currentIdx);
     int n = future.size();
     if (n == 0) {
-      LAST_PRED_N = 0; LAST_PRED_REJ_RATE = 0.0;
-      // Nulla da servire ⇒ non aumentiamo: basta garantire le repliche correnti
-      return Math.max(POOL_MIN, busyNow);
+      lastPredictedSampleCount   = 0;
+      lastPredictedRejectionRate = 0.0;
+      return Math.max(MIN_POOL, busyNow);
     }
 
-    ClassProb cp = readClassEntryProbs(m);
+    ClassProb entryProbs = readClassPhaseEntryProbs(model);
 
-    // Prova target crescenti: da max(busyNow, POOL_MIN) fino a POOL_MAX + busyNow
-    int lowerTot = Math.max(busyNow, POOL_MIN);
-    int upperTot = Math.max(lowerTot, POOL_MAX); // TOT = busy + pool, con pool ≤ POOL_MAX
+    // Prova target crescenti: da max(busyNow, MIN_POOL) a busyNow+MAX_POOL
+    int lowerTot = Math.max(busyNow, MIN_POOL);
+    int upperTot = Math.max(lowerTot, busyNow + MAX_POOL);
 
     for (int targetTot = lowerTot; targetTot <= upperTot; targetTot++) {
-      // Snapshot iniziale
-      SimSnap s = new SimSnap(now, poolNow, ph1, ph2, ph3, ph4);
-      // Forza subito pool per ottenere il totale desiderato (cambio immediato)
+
+      SimSnapshot s = new SimSnapshot(now, poolNow, ph1, ph2, ph3, ph4);
       s.pool = Math.max(0, targetTot - s.busy());
 
-      int rej = simulateWindowDeterministic_noSpin(s, future, targetTot, cp, rng);
+      int rej = simulateHorizonNoSpin(s, future, targetTot, entryProbs, rng);
       double rate = (double) rej / n;
 
-      if (rate <= SLO) {
-        LAST_PRED_N = n;
-        LAST_PRED_REJ_RATE = rate;
+      if (rate <= TARGET_REJECTION) {
+        lastPredictedSampleCount   = n;
+        lastPredictedRejectionRate = rate;
         return targetTot;
       }
     }
 
-    // Nessun totale rispetta SLO ⇒ usa il massimo provato (clamp esplicito)
-    LAST_PRED_N = n;
-    LAST_PRED_REJ_RATE = 1.0;
+    // Nessun totale rispetta lo SLO quindi uso il massimo provato
+    lastPredictedSampleCount   = n;
+    lastPredictedRejectionRate = 1.0;
     return upperTot;
   }
 
-  // Simula la finestra futura SENZA ritardi di scaling: totale costante
-  static int simulateWindowDeterministic_noSpin(
-      SimSnap s,
-      List<Arrival> future,
+  static int simulateHorizonNoSpin(
+      SimSnapshot s,
+      List<ArrivalEvent> future,
       int targetTotReplicas,
-      ClassProb cp,
+      ClassProb entryProbs,
       Random rng
   ){
     int rejections = 0;
 
-    for (Arrival a : future) {
-      // Avanza fino a a.t
-      cheapAdvanceSnapshot(s, a.t - s.t, rng);
+    for (ArrivalEvent a : future) {
+      // Avanza fino a a.timeSec
+      advanceSnapshotByCompetingExponentials(s, a.timeSec - s.time, rng);
 
       // Totale costante: pool = targetTot - busy
       int needPool = Math.max(0, targetTotReplicas - s.busy());
-      s.pool = Math.min(POOL_MAX, needPool);
+      s.pool = Math.min(MAX_POOL, needPool);
 
       // Inject
-      double[] p = (a.cls == 1) ? cp.c1 : (a.cls == 2) ? cp.c2 : cp.c3;
+      double[] p = (a.classId == 1) ? entryProbs.c1 : (a.classId == 2) ? entryProbs.c2 : entryProbs.c3;
       if (s.pool <= 0) {
         rejections++;
       } else {
         s.pool--;
-        int ph = pickPhaseWithProbs(p, rng);
+        int ph = pickPhaseFromProbs(p, rng);
         if      (ph == 1) s.ph1++;
         else if (ph == 2) s.ph2++;
         else if (ph == 3) s.ph3++;
         else              s.ph4++;
       }
-      s.t = a.t;
+      s.time = a.timeSec;
     }
     return rejections;
   }
 
   // ----------------- Snapshot & utility per la simulazione -----------------
 
-  static final class SimSnap {
-    double t;
+  static final class SimSnapshot {
+    double time;
     int pool;
     int ph1, ph2, ph3, ph4;
-    SimSnap(double t, int pool, int ph1, int ph2, int ph3, int ph4){
-      this.t=t; this.pool=pool; this.ph1=ph1; this.ph2=ph2; this.ph3=ph3; this.ph4=ph4;
+    SimSnapshot(double t, int pool, int ph1, int ph2, int ph3, int ph4){
+      this.time=t; this.pool=pool; this.ph1=ph1; this.ph2=ph2; this.ph3=ph3; this.ph4=ph4;
     }
     int busy(){ return ph1+ph2+ph3+ph4; }
   }
@@ -294,18 +288,18 @@ public class TimeseriesSimulator {
     final double[] c3 = new double[5];
   }
 
-  static ClassProb readClassEntryProbs(ModelOris2_fase4.GspnModel m){
+  static ClassProb readClassPhaseEntryProbs(ModelOris2_fase4.GspnModel model){
     ClassProb cp = new ClassProb();
-    double[] p1 = classEntryProb(m, 1);
-    double[] p2 = classEntryProb(m, 2);
-    double[] p3 = classEntryProb(m, 3);
+    double[] p1 = classPhaseEntryProbs(model, 1);
+    double[] p2 = classPhaseEntryProbs(model, 2);
+    double[] p3 = classPhaseEntryProbs(model, 3);
     System.arraycopy(p1,0,cp.c1,0,5);
     System.arraycopy(p2,0,cp.c2,0,5);
     System.arraycopy(p3,0,cp.c3,0,5);
     return cp;
   }
 
-  static int pickPhaseWithProbs(double[] probs, Random rng){
+  static int pickPhaseFromProbs(double[] probs, Random rng){
     double u = rng.nextDouble();
     double c1 = probs[1];
     double c2 = c1 + probs[2];
@@ -316,44 +310,32 @@ public class TimeseriesSimulator {
     return 4;
   }
 
-  static void cheapAdvanceSnapshot(SimSnap s, double dt, Random rng){
+  static void advanceSnapshotByCompetingExponentials(SimSnapshot s, double dt, Random rng){
     if (dt <= 0) return;
-    double tauMix = tauMixSnapshot(s);
-    if (tauMix <= 0) { s.t += dt; return; }
+    double t = 0.0;
+    final int bph = Math.max(1, (cachedBphDiv != null ? cachedBphDiv : 10));
 
-    int busy = s.busy();
-    if (busy <= 0) { s.t += dt; return; }
+    while (true) {
+      double r1 = (s.ph1 > 0) ? (1.0 * s.ph1) / bph : 0.0;
+      double r2 = (s.ph2 > 0) ? (2.0 * s.ph2) / bph : 0.0;
+      double r3 = (s.ph3 > 0) ? (3.0 * s.ph3) / bph : 0.0;
+      double r4 = (s.ph4 > 0) ? (4.0 * s.ph4) / bph : 0.0;
+      double R = r1 + r2 + r3 + r4;
+      if (R <= 0.0) { s.time += (dt - t); return; }
 
-    double expected = (busy * dt) / tauMix;
-    int completions = (int)Math.floor(expected);
-    double frac = expected - completions;
-    if (rng.nextDouble() < frac) completions++;
+      double tau = sampleExp(R, rng);
+      if (t + tau >= dt) { s.time += (dt - t); return; }
 
-    if (completions > busy) completions = busy;
-    if (completions <= 0) { s.t += dt; return; }
-
-    int rem = completions;
-    rem = takeFromPhaseSnap(() -> s.ph4, (v)-> s.ph4=v, rem);
-    rem = takeFromPhaseSnap(() -> s.ph3, (v)-> s.ph3=v, rem);
-    rem = takeFromPhaseSnap(() -> s.ph2, (v)-> s.ph2=v, rem);
-    rem = takeFromPhaseSnap(() -> s.ph1, (v)-> s.ph1=v, rem);
-
-    int done = completions - rem;
-    if (done > 0) s.pool += done; // token tornano liberi
-    s.t += dt;
+      t += tau;
+      int ev = sampleIndexByWeights(new double[]{r1, r2, r3, r4}, rng);
+      if (ev == 0 && s.ph1 > 0) { s.ph1--; s.ph2++; }
+      else if (ev == 1 && s.ph2 > 0) { s.ph2--; s.ph3++; }
+      else if (ev == 2 && s.ph3 > 0) { s.ph3--; s.ph4++; }
+      else if (ev == 3 && s.ph4 > 0) { s.ph4--; s.pool++; }
+    }
   }
 
-  interface IntGetter { int get(); }
-  interface IntSetter { void set(int v); }
-  static int takeFromPhaseSnap(IntGetter g, IntSetter s, int need){
-    if (need <= 0) return 0;
-    int have = g.get();
-    int take = Math.min(have, need);
-    if (take > 0) s.set(have - take);
-    return need - take;
-  }
-
-  static double tauMixSnapshot(SimSnap s){
+  static double tauMixSnapshot(SimSnapshot s){
     double[] tau = phaseMeanTimesStatic();
     int b = s.busy();
     if (b <= 0) return 0.0;
@@ -365,120 +347,148 @@ public class TimeseriesSimulator {
   }
 
   static double[] phaseMeanTimesStatic() {
-    int bph = (CACHED_BPH != null) ? CACHED_BPH : 10;
+    int bph = (cachedBphDiv != null) ? cachedBphDiv : 10;
     double t1 = bph / 1.0, t2 = bph / 2.0, t3 = bph / 3.0, t4 = bph / 4.0;
     return new double[]{ 0.0, t1+t2+t3+t4, t2+t3+t4, t3+t4, t4 };
   }
 
   // ----------------- Avanzamento reale e integrazione idle -----------------
 
-  static final class Delta {
-    final double idle; // area (integrale) di idle su [t0,t1]
-    final double dt;   // durata intervallo
-    Delta(double idle, double dt){ this.idle = idle; this.dt = dt; }
+  static final class StepDelta {
+    final double idleArea; // integrale di Pool su [t0,t1]
+    final double dt;
+    StepDelta(double idleArea, double dt){ this.idleArea = idleArea; this.dt = dt; }
   }
 
-  static Delta advanceAndIntegrate(
-      ModelOris2_fase4.GspnModel m, Random rng,
+  static StepDelta advanceModelAndIntegrateIdle(
+      ModelOris2_fase4.GspnModel model, Random rng,
       double t0, double t1
   ){
-    if (t1 <= t0) return new Delta(0.0, 0.0);
-    double dt = t1 - t0;
-    int poolStart = get(m,"Pool");
-    cheapAdvance(m, dt, rng);
-    int poolEnd = get(m,"Pool");
-    double idleTrap = 0.5 * (poolStart + poolEnd) * dt; // trapezio
-    return new Delta(idleTrap, dt);
+    if (t1 <= t0) return new StepDelta(0.0, 0.0);
+
+    double t = t0;
+    double idleArea = 0.0;
+    int pool = getTokens(model,"Pool");
+    final int bph = Math.max(1, getTokens(model,"BphDiv"));
+
+    while (true) {
+      // rate t1..t4 in base ai token presenti
+      int ph1 = getTokens(model,"Ph1"), ph2 = getTokens(model,"Ph2"), ph3 = getTokens(model,"Ph3"), ph4 = getTokens(model,"Ph4");
+      double r1 = (ph1 > 0) ? (1.0 * ph1) / bph : 0.0;
+      double r2 = (ph2 > 0) ? (2.0 * ph2) / bph : 0.0;
+      double r3 = (ph3 > 0) ? (3.0 * ph3) / bph : 0.0;
+      double r4 = (ph4 > 0) ? (4.0 * ph4) / bph : 0.0;
+      double R = r1 + r2 + r3 + r4;
+
+      if (R <= 0.0) {
+        idleArea += pool * (t1 - t);
+        break;
+      }
+
+      double tau = sampleExp(R, rng);
+      if (t + tau >= t1) {
+        idleArea += pool * (t1 - t);
+        break;
+      }
+
+      // integra idle fino al prossimo completamento
+      idleArea += pool * tau;
+      t += tau;
+
+      // determina quale transizione "scatta"
+      int ev = sampleIndexByWeights(new double[]{r1, r2, r3, r4}, rng);
+      if (ev == 0 && ph1 > 0) { setTokens(model,"Ph1", ph1 - 1); setTokens(model,"Ph2", ph2 + 1); }
+      else if (ev == 1 && ph2 > 0) { setTokens(model,"Ph2", ph2 - 1); setTokens(model,"Ph3", ph3 + 1); }
+      else if (ev == 2 && ph3 > 0) { setTokens(model,"Ph3", ph3 - 1); setTokens(model,"Ph4", ph4 + 1); }
+      else if (ev == 3 && ph4 > 0) { setTokens(model,"Ph4", ph4 - 1); setTokens(model,"Pool", pool + 1); pool = pool + 1; }
+      // NB: aggiorno 'pool' locale solo quando Ph4->Pool
+    }
+
+    return new StepDelta(idleArea, t1 - t0);
   }
 
   // ----------------- Dinamica sul modello reale -----------------
 
-  static void cheapAdvance(ModelOris2_fase4.GspnModel m, double dt, Random rng){
+  static void advanceModelByCompetingExponentials(ModelOris2_fase4.GspnModel model, double dt, Random rng){
     if (dt <= 0) return;
-    double tauMix = mixMeanService(m);
-    if (tauMix <= 0) return;
 
-    int busy = busyCount(m);
-    if (busy <= 0) return;
+    double t = 0.0;
+    final int bph = Math.max(1, getTokens(model,"BphDiv"));
 
-    double expected = (busy * dt) / tauMix;
-    int completions = (int)Math.floor(expected);
-    double frac = expected - completions;
-    if (rng.nextDouble() < frac) completions++;
+    while (true) {
+      int ph1 = getTokens(model,"Ph1"), ph2 = getTokens(model,"Ph2"), ph3 = getTokens(model,"Ph3"), ph4 = getTokens(model,"Ph4");
+      double r1 = (ph1 > 0) ? (1.0 * ph1) / bph : 0.0;
+      double r2 = (ph2 > 0) ? (2.0 * ph2) / bph : 0.0;
+      double r3 = (ph3 > 0) ? (3.0 * ph3) / bph : 0.0;
+      double r4 = (ph4 > 0) ? (4.0 * ph4) / bph : 0.0;
+      double R = r1 + r2 + r3 + r4;
 
-    if (completions > busy) completions = busy;
-    if (completions <= 0) return;
+      if (R <= 0.0) return;
 
-    int rem = completions;
-    rem = takeFromPhase(m, "Ph4", rem);
-    rem = takeFromPhase(m, "Ph3", rem);
-    rem = takeFromPhase(m, "Ph2", rem);
-    rem = takeFromPhase(m, "Ph1", rem);
+      double tau = sampleExp(R, rng);
+      if (t + tau >= dt) return;
 
-    int done = completions - rem;
-    if (done > 0) set(m, "Pool", get(m,"Pool") + done);
+      t += tau;
+      int ev = sampleIndexByWeights(new double[]{r1, r2, r3, r4}, rng);
+      if (ev == 0 && ph1 > 0) { setTokens(model,"Ph1", ph1 - 1); setTokens(model,"Ph2", ph2 + 1); }
+      else if (ev == 1 && ph2 > 0) { setTokens(model,"Ph2", ph2 - 1); setTokens(model,"Ph3", ph3 + 1); }
+      else if (ev == 2 && ph3 > 0) { setTokens(model,"Ph3", ph3 - 1); setTokens(model,"Ph4", ph4 + 1); }
+      else if (ev == 3 && ph4 > 0) { setTokens(model,"Ph4", ph4 - 1); setTokens(model,"Pool", getTokens(model,"Pool") + 1); }
+    }
   }
 
-  static int takeFromPhase(ModelOris2_fase4.GspnModel m, String ph, int need){
-    if (need <= 0) return 0;
-    int have = get(m, ph);
-    int take = Math.min(have, need);
-    if (take > 0) set(m, ph, have - take);
-    return need - take;
-  }
+  // ----------------- Tempi medi e mix di servizio -----------------
 
-  // ----------------- Tempi medi / mix di servizio -----------------
-
-  static double[] phaseMeanTimes(ModelOris2_fase4.GspnModel m) {
-    int bph = get(m,"BphDiv");
-    CACHED_BPH = bph; // aggiorna cache per lo snapshot
+  static double[] phaseMeanTimes(ModelOris2_fase4.GspnModel model) {
+    int bph = getTokens(model,"BphDiv");
+    cachedBphDiv = bph; // aggiorna cache per lo snapshot
     double t1 = bph / 1.0, t2 = bph / 2.0, t3 = bph / 3.0, t4 = bph / 4.0;
     return new double[]{ 0.0, t1+t2+t3+t4, t2+t3+t4, t3+t4, t4 };
   }
 
-  static double[] classEntryProb(ModelOris2_fase4.GspnModel m, int cls) {
+  static double[] classPhaseEntryProbs(ModelOris2_fase4.GspnModel model, int cls) {
     String p1="W11",p2="W12",p3="W13",p4="W14";
     if (cls==2){ p1="W21"; p2="W22"; p3="W23"; p4="W24"; }
     if (cls==3){ p1="W31"; p2="W32"; p3="W33"; p4="W34"; }
-    int w1=get(m,p1), w2=get(m,p2), w3=get(m,p3), w4=get(m,p4);
+    int w1=getTokens(model,p1), w2=getTokens(model,p2), w3=getTokens(model,p3), w4=getTokens(model,p4);
     double sum = Math.max(1, w1+w2+w3+w4);
     return new double[]{0.0, w1/sum, w2/sum, w3/sum, w4/sum};
   }
 
-  static double classMeanService(ModelOris2_fase4.GspnModel m, int cls) {
-    double[] tau = phaseMeanTimes(m);
-    double[] p   = classEntryProb(m, cls);
+  static double classMeanService(ModelOris2_fase4.GspnModel model, int cls) {
+    double[] tau = phaseMeanTimes(model);
+    double[] p   = classPhaseEntryProbs(model, cls);
     return p[1]*tau[1] + p[2]*tau[2] + p[3]*tau[3] + p[4]*tau[4];
   }
 
-  static double mixMeanService(ModelOris2_fase4.GspnModel m) {
+  static double mixMeanService(ModelOris2_fase4.GspnModel model) {
     // Se i Rate sono a 0 (disabilitati), usa un mix di default solo per calcolare tauMix
-    int r1 = get(m,"Rate1"), r2 = get(m,"Rate2"), r3 = get(m,"Rate3");
+    int r1 = getTokens(model,"Rate1"), r2 = getTokens(model,"Rate2"), r3 = getTokens(model,"Rate3");
     if (r1+r2+r3 == 0){ r1 = 5; r2 = 3; r3 = 2; }
-    double tau1 = classMeanService(m,1);
-    double tau2 = classMeanService(m,2);
-    double tau3 = classMeanService(m,3);
+    double tau1 = classMeanService(model,1);
+    double tau2 = classMeanService(model,2);
+    double tau3 = classMeanService(model,3);
     double sum = r1 + r2 + r3;
     return (r1*tau1 + r2*tau2 + r3*tau3) / Math.max(1.0, sum);
   }
 
-  // ----------------- Probability switch & inject -----------------
+  // ----------------- Probability switch e inject -----------------
 
-  static boolean injectArrival(ModelOris2_fase4.GspnModel m, int cls, Random rng){
-    int pool = get(m,"Pool");
+  static boolean injectArrival(ModelOris2_fase4.GspnModel model, int cls, Random rng){
+    int pool = getTokens(model,"Pool");
     if (pool <= 0) return false; // rejection
-    int ph = pickPhase(m, cls, rng);
+    int ph = pickEntryPhase(model, cls, rng);
     String dest = (ph==1)?"Ph1":(ph==2)?"Ph2":(ph==3)?"Ph3":"Ph4";
-    set(m,"Pool", pool-1);
-    set(m, dest, get(m,dest)+1);
+    setTokens(model,"Pool", pool-1);
+    setTokens(model, dest, getTokens(model,dest)+1);
     return true;
   }
 
-  static int pickPhase(ModelOris2_fase4.GspnModel m, int cls, Random rng){
+  static int pickEntryPhase(ModelOris2_fase4.GspnModel model, int cls, Random rng){
     String p1="W11",p2="W12",p3="W13",p4="W14";
     if (cls==2){ p1="W21"; p2="W22"; p3="W23"; p4="W24"; }
     if (cls==3){ p1="W31"; p2="W32"; p3="W33"; p4="W34"; }
-    int w1=get(m,p1), w2=get(m,p2), w3=get(m,p3), w4=get(m,p4);
+    int w1=getTokens(model,p1), w2=getTokens(model,p2), w3=getTokens(model,p3), w4=getTokens(model,p4);
     int sum = Math.max(1, w1+w2+w3+w4);
     double u = rng.nextDouble();
     double c1 = w1/(double)sum, c2 = c1 + w2/(double)sum, c3 = c2 + w3/(double)sum;
@@ -488,10 +498,10 @@ public class TimeseriesSimulator {
     return 4;
   }
 
-  // ----------------- I/O & utilità -----------------
+  // ----------------- I/O e utilità -----------------
 
-  static List<Arrival> readArrivals(String file) throws Exception {
-    List<Arrival> res = new ArrayList<>();
+  static List<ArrivalEvent> loadArrivalsCsv(String file) throws Exception {
+    List<ArrivalEvent> out = new ArrayList<>();
     try (BufferedReader br = new BufferedReader(new FileReader(file))) {
       String line = br.readLine(); // header
       while ((line = br.readLine()) != null) {
@@ -499,29 +509,29 @@ public class TimeseriesSimulator {
         if (s.length < 2) continue;
         double t = Double.parseDouble(s[0]);
         int cls = Integer.parseInt(s[1]);
-        res.add(new Arrival(t, cls));
+        out.add(new ArrivalEvent(t, cls));
       }
     }
-    res.sort(Comparator.comparingDouble(a -> a.t));
-    return res;
+    out.sort(Comparator.comparingDouble(a -> a.timeSec));
+    return out;
   }
 
-  static List<Arrival> sliceArrivals(List<Arrival> arr, double from, double to, int startIdx){
-    List<Arrival> out = new ArrayList<>();
+  static List<ArrivalEvent> sliceArrivalsInWindow(List<ArrivalEvent> arr, double from, double to, int startIdx){
+    List<ArrivalEvent> out = new ArrayList<>();
     for (int i = Math.max(0, startIdx); i < arr.size(); i++){
-      Arrival a = arr.get(i);
-      if (a.t < from) continue;
-      if (a.t >= to) break;
+      ArrivalEvent a = arr.get(i);
+      if (a.timeSec < from) continue;
+      if (a.timeSec >= to) break;
       out.add(a);
     }
     return out;
   }
 
-  static void writeIntervalIfClosed(PrintWriter csvInt,
-                                    double tStart, double tEnd,
-                                    int poolNow, int targetTot, double effChangeTime,
-                                    int arrivalsInInterval, int rejectsInInterval, double idleIntegralInterval,
-                                    double predRejAtTarget, int predN) {
+  static void writeIntervalRowIfClosed(PrintWriter csvInt,
+                                       double tStart, double tEnd,
+                                       int poolNow, int targetTot, double effChangeTime,
+                                       int arrivalsInInterval, int rejectsInInterval, double idleIntegralInterval,
+                                       double predRejAtTarget, int predN) {
     if (tEnd <= tStart + 1e-12) return;
     double dt = tEnd - tStart;
     double idleMeanInt = idleIntegralInterval / dt;
@@ -534,25 +544,38 @@ public class TimeseriesSimulator {
         predRejAtTarget, predN);
   }
 
-  static void disableAutomaticArrivals(ModelOris2_fase4.GspnModel m){
-    set(m,"Rate1",0); set(m,"Rate2",0); set(m,"Rate3",0);
-    set(m,"RateDiv",1);
-    CACHED_BPH = get(m,"BphDiv"); // cache per lo snapshot
+  static void disableModelAutomaticArrivals(ModelOris2_fase4.GspnModel model){
+    setTokens(model,"Rate1",0); setTokens(model,"Rate2",0); setTokens(model,"Rate3",0);
+    setTokens(model,"RateDiv",1);
+    cachedBphDiv = getTokens(model,"BphDiv"); // cache per lo snapshot
   }
 
-  static double roundUpToGrid(double t, double step){
+  static double ceilToGrid(double t, double step){
     double k = Math.ceil(t / step);
     return k * step;
   }
 
-  static int busyCount(ModelOris2_fase4.GspnModel m){
-    return get(m,"Ph1")+get(m,"Ph2")+get(m,"Ph3")+get(m,"Ph4");
+  static int countBusy(ModelOris2_fase4.GspnModel model){
+    return getTokens(model,"Ph1")+getTokens(model,"Ph2")+getTokens(model,"Ph3")+getTokens(model,"Ph4");
   }
 
-  static int get(ModelOris2_fase4.GspnModel m, String place){
-    return m.marking.getTokens(m.net.getPlace(place));
+  static int getTokens(ModelOris2_fase4.GspnModel model, String place){
+    return model.marking.getTokens(model.net.getPlace(place));
   }
-  static void set(ModelOris2_fase4.GspnModel m, String place, int v){
-    m.marking.setTokens(m.net.getPlace(place), v);
+  static void setTokens(ModelOris2_fase4.GspnModel model, String place, int v){
+    model.marking.setTokens(model.net.getPlace(place), v);
+  }
+
+  static double sampleExp(double rate, Random rng){
+    double u = Math.max(1e-12, 1.0 - rng.nextDouble());
+    return -Math.log(u) / rate;
+  }
+
+  static int sampleIndexByWeights(double[] w, Random rng){
+    double sum = 0.0; for (double v : w) sum += v;
+    if (sum <= 0.0) return 0;
+    double u = rng.nextDouble() * sum, acc = 0.0;
+    for (int i=0;i<w.length;i++){ acc += w[i]; if (u <= acc) return i; }
+    return w.length - 1;
   }
 }
