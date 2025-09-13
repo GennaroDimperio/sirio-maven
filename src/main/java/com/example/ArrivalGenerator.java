@@ -43,7 +43,7 @@ public class ArrivalGenerator {
       Random rngModel    = new Random(SEED_MODEL);
 
       double now = 0.0;
-      WorkloadState wl = WorkloadState.UP; // partiamo in UP
+      WorkloadState wl = WorkloadState.UP; // parte in UP
 
       // Arrivi Poisson omogenei (somma del mix è costante)
       final double arrivalLambda = (mixR1 + mixR2 + mixR3) / (double) ARRIVAL_RATE_DIV;
@@ -117,7 +117,7 @@ public class ArrivalGenerator {
 
   // Utility
 
-  // Quanto spesso cambiamo “modalità” di workload
+  // Quanto spesso cambia “modalità” di workload
   static double workloadStateRate(WorkloadState s) {
     switch (s) {
       case UP:           return 5.0 / WORKLOAD_RATE_DIV;
