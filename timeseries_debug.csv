@@ -1,0 +1,39 @@
+time|event
+0.449|arrivo classe=3: accettato in Ph3; stato corrente: Pool=7, Ph1=0, Ph2=0, Ph3=1, Ph4=0
+1.069|movimento: token spostato da Ph3 a Ph4
+2.239|arrivo classe=1: accettato in Ph3; stato corrente: Pool=6, Ph1=0, Ph2=0, Ph3=1, Ph4=1
+2.508|arrivo classe=1: accettato in Ph3; stato corrente: Pool=5, Ph1=0, Ph2=0, Ph3=2, Ph4=1
+2.576|movimento: token completato da Ph4 a Pool
+3.102|arrivo classe=2: accettato in Ph4; stato corrente: Pool=5, Ph1=0, Ph2=0, Ph3=2, Ph4=1
+3.168|movimento: token spostato da Ph3 a Ph4
+3.247|movimento: token completato da Ph4 a Pool
+3.275|arrivo classe=3: accettato in Ph1; stato corrente: Pool=5, Ph1=1, Ph2=0, Ph3=1, Ph4=1
+4.139|movimento: token completato da Ph4 a Pool
+4.377|movimento: token spostato da Ph3 a Ph4
+6.176|arrivo classe=1: accettato in Ph2; stato corrente: Pool=5, Ph1=1, Ph2=1, Ph3=0, Ph4=1
+6.293|movimento: token spostato da Ph2 a Ph3
+6.525|movimento: token completato da Ph4 a Pool
+7.838|arrivo classe=2: accettato in Ph3; stato corrente: Pool=5, Ph1=1, Ph2=0, Ph3=2, Ph4=0
+8.243|arrivo classe=3: accettato in Ph3; stato corrente: Pool=4, Ph1=1, Ph2=0, Ph3=3, Ph4=0
+8.524|movimento: token spostato da Ph1 a Ph2
+10.722|arrivo classe=2: accettato in Ph1; stato corrente: Pool=3, Ph1=1, Ph2=1, Ph3=3, Ph4=0
+10.817|arrivo classe=2: accettato in Ph1; stato corrente: Pool=2, Ph1=2, Ph2=1, Ph3=3, Ph4=0
+10.909|movimento: token spostato da Ph3 a Ph4
+10.925|arrivo classe=3: accettato in Ph1; stato corrente: Pool=1, Ph1=3, Ph2=1, Ph3=2, Ph4=1
+10.999|movimento: token completato da Ph4 a Pool
+11.141|arrivo classe=2: accettato in Ph1; stato corrente: Pool=1, Ph1=4, Ph2=1, Ph3=2, Ph4=0
+11.331|movimento: token spostato da Ph1 a Ph2
+11.521|movimento: token spostato da Ph3 a Ph4
+12.039|movimento: token spostato da Ph1 a Ph2
+12.332|arrivo classe=1: accettato in Ph3; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=2, Ph4=1
+12.556|arrivo classe=3: RIFIUTATO; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=2, Ph4=1
+12.778|movimento: token spostato da Ph3 a Ph4
+13.064|arrivo classe=2: RIFIUTATO; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=1, Ph4=2
+13.233|arrivo classe=1: RIFIUTATO; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=1, Ph4=2
+13.342|arrivo classe=2: RIFIUTATO; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=1, Ph4=2
+13.816|arrivo classe=2: RIFIUTATO; stato corrente: Pool=0, Ph1=2, Ph2=3, Ph3=1, Ph4=2
+14.113|movimento: token spostato da Ph2 a Ph3
+14.682|movimento: token completato da Ph4 a Pool
+14.725|arrivo classe=3: accettato in Ph1; stato corrente: Pool=0, Ph1=3, Ph2=2, Ph3=2, Ph4=1
+14.819|arrivo classe=1: RIFIUTATO; stato corrente: Pool=0, Ph1=3, Ph2=2, Ph3=2, Ph4=1
+14.819|== STOP DEBUG: raggiunte 20 richieste ==
