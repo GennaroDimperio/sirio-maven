@@ -64,13 +64,13 @@ public class ArrivalGenerator {
         now = nextEventAt;
 
         if (nextEventAt == nextArrivalAt) {
-          // ===== Arrivo: estrai classe proporzionale al mix corrente
+          // Estrae classe proporzionale al mix corrente
           int cls = pickArrivalClass(mixR1, mixR2, mixR3, rngArrivals);
           out.printf(Locale.US, "%.6f,%d%n", now, cls);
           nextArrivalAt = now + sampleExp(arrivalLambda, rngArrivals);
 
         } else if (nextEventAt == nextWorkloadSwitchAt) {
-          // ===== Cambio di “modalità” del workload
+          // Cambio di “modalità” del workload
           wl = nextWorkloadState(wl);
           nextWorkloadSwitchAt = now + sampleExp(workloadStateRate(wl), rngModel);
 
@@ -81,7 +81,7 @@ public class ArrivalGenerator {
               : Double.POSITIVE_INFINITY;
 
         } else {
-          // ===== Variazione del mix (abilitata solo in UP/DOWN)
+          // Variazione del mix (abilitata solo in UP/DOWN)
           if (wl == WorkloadState.UP) {
             // up12 (r1->r2) e up23 (r2->r3)
             double rateUp12 = mixR1 * (1.0 / MIX_STEP_RATE_DIV);
@@ -115,7 +115,7 @@ public class ArrivalGenerator {
   System.out.println("[ok] arrivals.csv generato (T= " + T + "s)");
   }
 
-  // ======== Utility “parlanti” ========
+  // Utility
 
   // Quanto spesso cambiamo “modalità” di workload
   static double workloadStateRate(WorkloadState s) {
